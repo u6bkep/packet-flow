@@ -1,0 +1,7 @@
+local_addr = "127.0.0.1:8001"
+remote_addr = "127.0.0.1:8001"
+rate = 10
+influx_url = "http://influxdb.b.intern.gecko.network:8086"
+database = "packet_monitor"
+# token = "--nif-8ANZSJ6OSX5AmyfVihXbG9fYIC5tJiqiMaTLRpSSlzNtV187UQd8f_umWDnifOtgL3OjkGOo7MD1flZQ=="
+token = "rqEqiV9z3iBWLsy0pGIN-NZZdJc-lwuSc_aMpbU_ch5wXmEzC99mwE-n1bSJW3I5H3xtDfDLqjcOd52kWMDdKg=="
