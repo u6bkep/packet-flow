@@ -2,11 +2,12 @@ use chrono::prelude::{DateTime, Utc};
 use clap::Parser;
 use influxdb::{Client, InfluxDbWriteable, WriteQuery};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     net::UdpSocket,
     signal,
-    sync::mpsc::{self, Receiver, Sender, error as mpsc_error},
+    sync::mpsc::{self, Receiver, Sender},
     time::Duration as TokioDuration,
 };
 
@@ -76,6 +77,7 @@ struct Packet {
     sequence: u64,
     timestamp_us: u64,
     source: String,
+    is_final: bool, // New field to indicate this is the final packet from this sender
 }
 
 #[derive(Clone)]
@@ -134,75 +136,63 @@ impl UdpSender {
         let mut sequence = 0u64;
         let mut interval = tokio::time::interval(self.rate);
 
-        //check if program is running interactively
-        let is_tty = atty::is(atty::Stream::Stdin);
+        // Set up signal handler for SIGUSR1
+        let mut sigusr1 =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                .expect("Failed to install SIGUSR1 handler");
 
-        // spawn a thread to listen for keyboard input.
-        let (keyboard_notify_channel_tx, mut keyboard_notify_channel_rx) = mpsc::channel(1);
-        if is_tty {
-            tokio::spawn(async move {
-                loop {
-                    // use system stio to blocking read from stdin
-                    let mut read_buf = String::new();
-                    std::io::stdin().read_line(&mut read_buf).unwrap();
-                    keyboard_notify_channel_tx
-                        .send(read_buf.chars().nth(0))
-                        .await
-                        .unwrap();
-                    read_buf.clear();
-                }
-            });
-        } else {
-            drop(keyboard_notify_channel_tx);
-        }
+        // Set up a channel to receive shutdown notification
+        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        // Handle CTRL+C signal to ensure we send final packet
+        tokio::spawn(async move {
+            if let Ok(_) = signal::ctrl_c().await {
+                let _ = shutdown_tx.send(()).await;
+                println!("Received CTRL+C, shutting down sender");
+            }
+        });
 
         loop {
-            interval.tick().await;
-            let packet = Packet {
-                sequence,
-                timestamp_us: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_micros() as u64,
-                source: self.local_addr.clone(),
-            };
+            tokio::select! {
+            _ = interval.tick() => {
+                let packet = Packet {
+                    sequence,
+                    timestamp_us: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_micros() as u64,
+                    source: self.local_addr.clone(),
+                    is_final: false,
+                };
 
-            if let Ok(data) = bincode::serialize(&packet) {
-                self.socket.send(&data).await.unwrap();
-            }
+                if let Ok(data) = bincode::serialize(&packet) {
+                    self.socket.send(&data).await.unwrap();
+                }
 
-            sequence += 1;
+                sequence += 1;
+                }
 
-            if is_tty {
-                // check if space bar has been pressed, then skip a sequence number
-                match keyboard_notify_channel_rx.try_recv() {
-                    Ok(x) => {
-                        match x {
-                            Some(' ') => {
-                                println!("space bar pressed, skipping a sequence number");
-                                sequence += 1;
-                            }
-                            Some('1') => {
-                                println!("1 pressed, skipping 1 sequence number");
-                                sequence += 1;
-                            }
-                            Some('2') => {
-                                println!("2 pressed, skipping 2 sequence number");
-                                sequence += 2;
-                            }
-                            Some('3') => {
-                                println!("3 pressed, skipping 3 sequence number");
-                                sequence += 3;
-                            }
-                            _ => {}
-                        }
-                        sequence += 1;
+                _ = sigusr1.recv() => {
+                    println!("SIGUSR1 received, skipping a sequence number");
+                    sequence += 1;
                     }
-                    Err(mpsc_error::TryRecvError::Empty) => {}
-                    Err(mpsc_error::TryRecvError::Disconnected) => {
-                        println!("keyboard_notify_channel_rx disconnected");
-                        break;
+
+                _ = shutdown_rx.recv() => {
+                    // Send final packet with is_final=true
+                    let final_packet = Packet {
+                        sequence,
+                        timestamp_us: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64,
+                        source: self.local_addr.clone(),
+                        is_final: true,
+                    };
+
+                    if let Ok(data) = bincode::serialize(&final_packet) {
+                        let _ = self.socket.send(&data).await;
                     }
+                    println!("Sent final packet, shutting down sender");
+                    break;
                 }
             }
         }
@@ -213,23 +203,116 @@ struct UdpReceiver {
     socket: UdpSocket,
     measurement_tx: Sender<Measurement>,
     local_addr: String,
-    remote_addr: String,
+    timeout_duration: TokioDuration,
 }
 
 impl UdpReceiver {
     async fn run(&self) {
         let mut buffer = [0u8; 1024];
-        let mut last_sequence = 0;
+        // Track sequence numbers and last seen time for each sender
+        let mut last_sequences: HashMap<String, u64> = HashMap::new();
+        let mut last_seen: HashMap<String, SystemTime> = HashMap::new();
 
         println!("Listening on {}...", self.local_addr);
 
         loop {
-            match tokio::time::timeout(TokioDuration::from_secs(10), self.socket.recv(&mut buffer))
+            // Check for timeouts before receiving next packet
+            let now = SystemTime::now();
+            let timeout_senders: Vec<String> = last_seen
+                .iter()
+                .filter_map(|(sender, last_time)| {
+                    if now.duration_since(*last_time).ok()? > self.timeout_duration {
+                        Some(sender.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Report timeouts for each timed-out sender
+            for sender in &timeout_senders {
+                println!("Timeout for sender: {}", sender);
+                let loss = PacketLoss {
+                    time: Utc::now(),
+                    source: sender.clone(),
+                    destination: self.local_addr.clone(),
+                    value: 1,
+                };
+                self.measurement_tx
+                    .send(Measurement::PacketLoss(loss))
+                    .await
+                    .unwrap();
+            }
+
+            match tokio::time::timeout(TokioDuration::from_secs(1), self.socket.recv(&mut buffer))
                 .await
             {
                 Ok(Ok(size)) => {
                     if let Ok(packet) = bincode::deserialize::<Packet>(&buffer[..size]) {
-                        self.process_packet(packet, &mut last_sequence).await;
+                        // Process the packet inline here instead of in a separate function
+                        let now_micro = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64;
+                        let latency = now_micro - packet.timestamp_us;
+
+                        // Track last seen time for this sender
+                        last_seen.insert(packet.source.clone(), SystemTime::now());
+
+                        // Handle "is_final" packet by removing the sender from tracking
+                        if packet.is_final {
+                            println!(
+                                "Received final packet from {}, removing from tracking",
+                                packet.source
+                            );
+                            last_sequences.remove(&packet.source);
+                            last_seen.remove(&packet.source);
+                            continue;
+                        }
+
+                        // Get or insert the last sequence number for this sender
+                        let last_sequence = last_sequences
+                            .entry(packet.source.clone())
+                            .or_insert(packet.sequence);
+
+                        // Check for packet loss if we've seen this sender before
+                        if *last_sequence != packet.sequence
+                            && packet.sequence > last_sequence.wrapping_add(1)
+                        {
+                            println!(
+                                "Packet loss detected from {}: expected {}, got {}",
+                                packet.source,
+                                last_sequence.wrapping_add(1),
+                                packet.sequence
+                            );
+                            let lost_packets =
+                                packet.sequence.wrapping_sub(last_sequence.wrapping_add(1));
+                            let loss = PacketLoss {
+                                time: Utc::now(),
+                                source: packet.source.clone(),
+                                destination: self.local_addr.clone(),
+                                value: lost_packets,
+                            };
+                            self.measurement_tx
+                                .send(Measurement::PacketLoss(loss))
+                                .await
+                                .unwrap();
+                        }
+
+                        // Report latency
+                        let latency_measurement = Latency {
+                            time: Utc::now(),
+                            source: packet.source.clone(),
+                            destination: self.local_addr.clone(),
+                            value: latency,
+                        };
+                        self.measurement_tx
+                            .send(Measurement::Latency(latency_measurement))
+                            .await
+                            .unwrap();
+
+                        // Update the last sequence number for this sender
+                        *last_sequence = packet.sequence;
                     }
                 }
                 Ok(Err(e)) => {
@@ -237,62 +320,11 @@ impl UdpReceiver {
                     break;
                 }
                 Err(_) => {
-                    //timeout, report packet loss
-                    println!("no packet received. Reporting packet loss");
-                    let loss = PacketLoss {
-                        time: Utc::now(),
-                        source: self.local_addr.clone(),
-                        destination: self.remote_addr.clone(),
-                        value: 1,
-                    };
-                    self.measurement_tx
-                        .send(Measurement::PacketLoss(loss))
-                        .await
-                        .unwrap();
+                    // No packet received in this iteration, continue to check timeouts
+                    continue;
                 }
             }
         }
-    }
-
-    async fn process_packet(&self, packet: Packet, last_sequence: &mut u64) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as u64;
-        let latency = now - packet.timestamp_us;
-
-        if packet.sequence > last_sequence.wrapping_add(1) {
-            println!(
-                "Packet loss detected from {}: expected {}, got {}",
-                packet.source,
-                last_sequence.wrapping_add(1),
-                packet.sequence
-            );
-            let lost_packets = packet.sequence.wrapping_sub(last_sequence.wrapping_add(1));
-            let loss = PacketLoss {
-                time: Utc::now(),
-                source: packet.source.clone(),
-                destination: self.local_addr.clone(),
-                value: lost_packets,
-            };
-            self.measurement_tx
-                .send(Measurement::PacketLoss(loss))
-                .await
-                .unwrap();
-        }
-
-        let latency = Latency {
-            time: Utc::now(),
-            source: packet.source.clone(),
-            destination: self.local_addr.clone(),
-            value: latency,
-        };
-        self.measurement_tx
-            .send(Measurement::Latency(latency))
-            .await
-            .unwrap();
-
-        *last_sequence = packet.sequence;
     }
 }
 
@@ -360,10 +392,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             println!("spawning sender");
 
-            tokio::select! {
-                _ = signal::ctrl_c() => {println!("Shutting Down...")}
-                _ = sender_handle => {}
-            }
+            sender_handle.await?;
         }
         "receiver" => {
             let socket = UdpSocket::bind(&config.local_addr).await?;
@@ -388,7 +417,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 socket,
                 measurement_tx: tx,
                 local_addr: config.local_addr.clone(),
-                remote_addr: config.remote_addr.clone(),
+                timeout_duration: TokioDuration::from_secs(5),
             };
 
             let receiver_handle = tokio::spawn(async move { receiver.run().await });
@@ -432,7 +461,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 socket: receiver_socket,
                 measurement_tx: tx,
                 local_addr: config.local_addr.clone(),
-                remote_addr: config.remote_addr.clone(),
+                timeout_duration: TokioDuration::from_secs(5),
             };
 
             let sender_handle = tokio::spawn(async move { sender.run().await });
@@ -442,7 +471,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let reporter_handle = tokio::spawn(async move { reporter.run().await });
 
             tokio::select! {
-                _ = signal::ctrl_c() => {println!("Shutting Down...")}
                 _ = sender_handle => {}
                 _ = receiver_handle => {}
                 _ = reporter_handle => {}

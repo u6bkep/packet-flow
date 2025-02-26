@@ -1,5 +1,5 @@
 [package]
-name = "packet-monitor"
+name = "packet-flow"
 version = "0.1.0"
 edition = "2024"
 
