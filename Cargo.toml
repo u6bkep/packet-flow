@@ -12,3 +12,4 @@ influxdb = { version = "0.7", features = ["derive"] }
 chrono = "0.4"
 atty = "0.2"
 toml = "0.8"
+thiserror = "2.0"

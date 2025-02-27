@@ -3,6 +3,8 @@ use clap::Parser;
 use influxdb::{Client, InfluxDbWriteable, WriteQuery};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     net::UdpSocket,
@@ -10,16 +12,43 @@ use tokio::{
     sync::mpsc::{self, Receiver, Sender},
     time::Duration as TokioDuration,
 };
+use thiserror::Error;
+
+// comprehensive error type
+#[derive(Error, Debug)]
+enum AppError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    
+    #[error("TOML deserialization error: {0}")]
+    TomlDeserialize(#[from] toml::de::Error),
+    
+    #[error("TOML serialization error: {0}")]
+    TomlSerialize(#[from] toml::ser::Error),
+    
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
+    
+    #[error("InfluxDB token required but not provided")]
+    MissingToken,
+    
+    #[error("Invalid mode: {0}")]
+    InvalidMode(String),
+}
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
 struct Args {
-    /// Mode to run in: "sender" or "receiver"
+    /// Mode to run in: "sender", "receiver", or "both"
     #[clap(short, long)]
     mode: String,
 
     #[clap(short, long, default_value = "config.toml")]
-    config_file: String,
+    config_file: PathBuf,
+
+    /// Generate default config file and exit
+    #[clap(long)]
+    generate_config: bool,
 
     /// Local address to bind to
     #[clap(long)]
@@ -46,7 +75,7 @@ struct Args {
     token: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 struct Config {
     local_addr: String,
     remote_addr: String,
@@ -54,6 +83,155 @@ struct Config {
     influx_url: String,
     database: String,
     token: Option<String>,
+}
+
+impl Config {
+    // Create a default configuration
+    fn default() -> Self {
+        Self {
+            local_addr: "0.0.0.0:8000".to_string(),
+            remote_addr: "127.0.0.1:8000".to_string(),
+            rate: 1000,
+            influx_url: "http://localhost:8086".to_string(),
+            database: "network_monitor".to_string(),
+            token: None,
+        }
+    }
+
+    // Apply environment variables to override config values
+    fn apply_env_vars(&mut self) {
+        if let Ok(val) = env::var("PACKET_FLOW_LOCAL_ADDR") {
+            self.local_addr = val;
+        }
+        
+        if let Ok(val) = env::var("PACKET_FLOW_REMOTE_ADDR") {
+            self.remote_addr = val;
+        }
+        
+        if let Ok(val) = env::var("PACKET_FLOW_RATE") {
+            if let Ok(rate) = val.parse::<u64>() {
+                self.rate = rate;
+            } else {
+                eprintln!("Warning: Invalid PACKET_FLOW_RATE value '{}', ignoring", val);
+            }
+        }
+        
+        if let Ok(val) = env::var("PACKET_FLOW_INFLUX_URL") {
+            self.influx_url = val;
+        }
+        
+        if let Ok(val) = env::var("PACKET_FLOW_DATABASE") {
+            self.database = val;
+        }
+        
+        if let Ok(val) = env::var("PACKET_FLOW_TOKEN") {
+            self.token = Some(val);
+        }
+    }
+
+    // Apply command-line arguments to override config values
+    fn apply_args(&mut self, args: &Args) {
+        if let Some(addr) = &args.local_addr {
+            self.local_addr = addr.clone();
+        }
+        if let Some(addr) = &args.remote_addr {
+            self.remote_addr = addr.clone();
+        }
+        if let Some(rate) = args.rate {
+            self.rate = rate;
+        }
+        if let Some(url) = &args.influx_url {
+            self.influx_url = url.clone();
+        }
+        if let Some(db) = &args.database {
+            self.database = db.clone();
+        }
+        if let Some(token) = &args.token {
+            self.token = Some(token.clone());
+        }
+    }
+
+    // Validate configuration values
+    fn validate(&self) -> Result<(), AppError>{
+        // Check that addresses are valid
+        if self.local_addr.split(':').count() != 2 {
+            return Err(AppError::InvalidConfig(format!("Invalid local address: {}", self.local_addr)));
+        }
+        
+        if self.remote_addr.split(':').count() != 2 {
+            return Err(AppError::InvalidConfig(format!("Invalid remote address: {}", self.remote_addr)));
+        }
+        
+        // Check that rate is reasonable
+        if self.rate < 1 || self.rate > 10000 {
+            return Err(AppError::InvalidConfig(format!("Rate must be between 1 and 10000, got {}", self.rate)));
+        }
+        
+        // Minimal URL validation
+        if !self.influx_url.starts_with("http://") && !self.influx_url.starts_with("https://") {
+            return Err(AppError::InvalidConfig(format!("InfluxDB URL must start with http:// or https://")));
+        }
+        
+        Ok(())
+    }
+
+    // Load configuration from file and apply command-line overrides
+    fn load(args: &Args) -> Result<Self, AppError> {
+        // Config loading priority (highest to lowest):
+        // 1. Command-line arguments
+        // 2. Environment variables
+        // 3. Config file
+        // 4. Default values
+        
+        let mut config = if args.config_file.exists() {
+            let contents = std::fs::read_to_string(&args.config_file)?;
+            println!("Reading configuration from file: {}", args.config_file.display());
+            match toml::from_str::<Config>(&contents) {
+                Ok(config) => config,
+                Err(e) => {
+                    eprintln!("Error parsing config file: {}", e);
+                    println!("Falling back to default configuration");
+                    Config::default()
+                }
+            }
+        } else {
+            println!("Config file not found. Using default configuration.");
+            Config::default()
+        };
+        
+        // Apply environment variables
+        config.apply_env_vars();
+        
+        // Apply command-line arguments (highest priority)
+        config.apply_args(args);
+        
+        // Validate the final configuration
+        config.validate()?;
+        
+        Ok(config)
+    }
+
+    // Save configuration to file
+    fn save(&self, path: &PathBuf) -> Result<(), AppError> {
+        let contents = toml::to_string_pretty(self).map_err(AppError::TomlSerialize)?;
+        std::fs::write(path, contents)?;
+        println!("Default configuration saved to {}", path.display());
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Config {{\n")?;
+        write!(f, "  local bind address: {}\n", self.local_addr)?;
+        write!(f, "  remote address: {}\n", self.remote_addr)?;
+        write!(f, "  rate: {}ms\n", self.rate)?;
+        write!(f, "  influx url: {}\n", self.influx_url)?;
+        write!(f, "  database (bucket): {}\n", self.database)?;
+        write!(f, "  token: {}\n", self.token.as_ref().map(|_| "****").unwrap_or("Not set"))?;
+        write!(f, "}}")
+    }
+    
 }
 
 #[derive(InfluxDbWriteable, Clone)]
@@ -329,70 +507,46 @@ impl UdpReceiver {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let default_config: Config = Config {
-        local_addr: "0.0.0.0:8000".to_string(),
-        remote_addr: "127.0.0.1:8000".to_string(),
-        rate: 1000,
-        influx_url: "http://localhost:8086".to_string(),
-        database: "network_monitor".to_string(),
-        token: None,
-    };
+async fn main() -> Result<(), AppError> {
     let args = Args::parse();
-
-    // handle configuration. options not supplied in the command line will be read from the config file. options not supplied in the config file will be set to the default value.
-    let file = std::fs::read_to_string(&args.config_file);
-    let config: Config = match file {
-        Ok(contents) => {
-            println!("Reading configuration from file: {}", args.config_file);
-            toml::from_str(&contents).unwrap()
-        }
-        Err(e) => {
-            println!(
-                "Error reading config file: {}. Using default configuration.",
-                e
-            );
-            let mut config = default_config;
-            if args.local_addr.is_some() {
-                config.local_addr = args.local_addr.clone().unwrap();
-            }
-            if args.remote_addr.is_some() {
-                config.remote_addr = args.remote_addr.clone().unwrap();
-            }
-            if args.rate.is_some() {
-                config.rate = args.rate.unwrap();
-            }
-            if args.influx_url.is_some() {
-                config.influx_url = args.influx_url.clone().unwrap();
-            }
-            if args.database.is_some() {
-                config.database = args.database.clone().unwrap();
-            }
-            if args.token.is_some() {
-                config.token = args.token.clone();
-            }
-            config
-        }
-    };
-
-    match args.mode.as_str() {
+    
+    // Handle config generation request
+    if args.generate_config {
+        return Config::default().save(&args.config_file);
+    }
+    
+    // Load and validate configuration
+    let config = Config::load(&args)?;
+    
+    // Show current configuration
+    println!("Configuration:\n{}", config);
+    
+    // Validate mode
+    let mode = args.mode.as_str();
+    if !["sender", "receiver", "both"].contains(&mode) {
+        return Err(AppError::InvalidMode(mode.to_string()));
+    }
+    
+    // For receiver and both modes, verify token upfront
+    if (mode == "receiver" || mode == "both") && config.token.is_none() {
+        return Err(AppError::MissingToken);
+    }
+    
+    match mode {
         "sender" => {
             let socket = UdpSocket::bind("0.0.0.0:0").await?;
             socket.connect(&config.remote_addr).await?;
-
-            println!("in sender mode");
-
+            
+            println!("Running in sender mode");
+            
             let sender = UdpSender {
                 socket,
                 rate: TokioDuration::from_millis(config.rate),
                 local_addr: config.local_addr.clone(),
             };
-
+            
             let sender_handle = tokio::spawn(async move { sender.run().await });
-
-            println!("spawning sender");
-
-            sender_handle.await?;
+            sender_handle.await.map_err(|_| AppError::InvalidConfig("Sender task failed".to_string()))?;
         }
         "receiver" => {
             let socket = UdpSocket::bind(&config.local_addr).await?;
