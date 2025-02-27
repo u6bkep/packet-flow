@@ -14,6 +14,9 @@ use tokio::{
 };
 use thiserror::Error;
 
+// Environment variable for config file path
+const CONFIG_FILE_ENV_VAR: &str = "PACKET_FLOW_CONFIG";
+
 // comprehensive error type
 #[derive(Error, Debug)]
 enum AppError {
@@ -29,8 +32,8 @@ enum AppError {
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
     
-    #[error("InfluxDB token required but not provided")]
-    MissingToken,
+    #[error("No InfluxDB authentication provided")]
+    MissingAuthentication,
     
     #[error("Invalid mode: {0}")]
     InvalidMode(String),
@@ -41,7 +44,7 @@ enum AppError {
 struct Args {
     /// Mode to run in: "sender", "receiver", or "both"
     #[clap(short, long)]
-    mode: String,
+    mode: Option<String>,
 
     #[clap(short, long, default_value = "config.toml")]
     config_file: PathBuf,
@@ -73,33 +76,50 @@ struct Args {
     /// InfluxDB token
     #[clap(short, long)]
     token: Option<String>,
+    
+    /// InfluxDB username
+    #[clap(short = 'u', long)]
+    username: Option<String>,
+    
+    /// InfluxDB password
+    #[clap(short = 'p', long)]
+    password: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 struct Config {
+    mode: Option<String>, // Add mode to the config
     local_addr: String,
     remote_addr: String,
     rate: u64,
     influx_url: String,
     database: String,
     token: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
 }
 
 impl Config {
     // Create a default configuration
     fn default() -> Self {
         Self {
+            mode: None, // Default mode is None
             local_addr: "0.0.0.0:8000".to_string(),
             remote_addr: "127.0.0.1:8000".to_string(),
             rate: 1000,
             influx_url: "http://localhost:8086".to_string(),
-            database: "network_monitor".to_string(),
+            database: "packet_flow".to_string(),
             token: None,
+            username: None,
+            password: None,
         }
     }
 
     // Apply environment variables to override config values
     fn apply_env_vars(&mut self) {
+        if let Ok(val) = env::var("PACKET_FLOW_MODE") {
+            self.mode = Some(val);
+        }
         if let Ok(val) = env::var("PACKET_FLOW_LOCAL_ADDR") {
             self.local_addr = val;
         }
@@ -127,10 +147,21 @@ impl Config {
         if let Ok(val) = env::var("PACKET_FLOW_TOKEN") {
             self.token = Some(val);
         }
+        
+        if let Ok(val) = env::var("PACKET_FLOW_USERNAME") {
+            self.username = Some(val);
+        }
+        
+        if let Ok(val) = env::var("PACKET_FLOW_PASSWORD") {
+            self.password = Some(val);
+        }
     }
 
     // Apply command-line arguments to override config values
     fn apply_args(&mut self, args: &Args) {
+        if let Some(mode) = &args.mode {
+            self.mode = Some(mode.clone());
+        }
         if let Some(addr) = &args.local_addr {
             self.local_addr = addr.clone();
         }
@@ -149,10 +180,22 @@ impl Config {
         if let Some(token) = &args.token {
             self.token = Some(token.clone());
         }
+        if let Some(username) = &args.username {
+            self.username = Some(username.clone());
+        }
+        if let Some(password) = &args.password {
+            self.password = Some(password.clone());
+        }
     }
 
     // Validate configuration values
     fn validate(&self) -> Result<(), AppError>{
+        // Check that mode is valid
+        if let Some(ref mode) = self.mode {
+            if !["sender", "receiver", "both"].contains(&mode.as_str()) {
+                return Err(AppError::InvalidMode(mode.clone()));
+            }
+        }
         // Check that addresses are valid
         if self.local_addr.split(':').count() != 2 {
             return Err(AppError::InvalidConfig(format!("Invalid local address: {}", self.local_addr)));
@@ -175,6 +218,11 @@ impl Config {
         Ok(())
     }
 
+    // Check if authentication credentials are provided
+    fn has_authentication(&self) -> bool {
+        self.token.is_some() || (self.username.is_some() && self.password.is_some())
+    }
+
     // Load configuration from file and apply command-line overrides
     fn load(args: &Args) -> Result<Self, AppError> {
         // Config loading priority (highest to lowest):
@@ -183,9 +231,17 @@ impl Config {
         // 3. Config file
         // 4. Default values
         
-        let mut config = if args.config_file.exists() {
-            let contents = std::fs::read_to_string(&args.config_file)?;
-            println!("Reading configuration from file: {}", args.config_file.display());
+        // Check for config file path in environment variable
+        let config_path = if let Ok(env_path) = env::var(CONFIG_FILE_ENV_VAR) {
+            println!("Using config file from environment variable: {}", env_path);
+            PathBuf::from(env_path)
+        } else {
+            args.config_file.clone()
+        };
+        
+        let mut config = if config_path.exists() {
+            let contents = std::fs::read_to_string(&config_path)?;
+            println!("Reading configuration from file: {}", config_path.display());
             match toml::from_str::<Config>(&contents) {
                 Ok(config) => config,
                 Err(e) => {
@@ -223,12 +279,15 @@ impl Config {
 impl std::fmt::Display for Config {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "Config {{\n")?;
+        write!(f, "  mode: {}\n", self.mode.as_deref().unwrap_or("Not set"))?;
         write!(f, "  local bind address: {}\n", self.local_addr)?;
         write!(f, "  remote address: {}\n", self.remote_addr)?;
         write!(f, "  rate: {}ms\n", self.rate)?;
         write!(f, "  influx url: {}\n", self.influx_url)?;
         write!(f, "  database (bucket): {}\n", self.database)?;
         write!(f, "  token: {}\n", self.token.as_ref().map(|_| "****").unwrap_or("Not set"))?;
+        write!(f, "  username: {}\n", self.username.as_deref().unwrap_or("Not set"))?;
+        write!(f, "  password: {}\n", self.password.as_ref().map(|_| "****").unwrap_or("Not set"))?;
         write!(f, "}}")
     }
     
@@ -506,13 +565,38 @@ impl UdpReceiver {
     }
 }
 
+// Helper function to create the InfluxDB client with appropriate authentication
+fn create_influx_client(config: &Config) -> Result<Client, AppError> {
+    let client = Client::new(&config.influx_url, &config.database);
+    
+    // Prefer token auth if available
+    if let Some(token) = &config.token {
+        return Ok(client.with_token(token));
+    }
+    
+    // Fall back to username/password auth
+    if let (Some(username), Some(password)) = (&config.username, &config.password) {
+        return Ok(client.with_auth(username, password));
+    }
+    
+    // No auth provided
+    Err(AppError::MissingAuthentication)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
     let args = Args::parse();
     
     // Handle config generation request
     if args.generate_config {
-        return Config::default().save(&args.config_file);
+        // Check for config file path in environment variable
+        let config_path = if let Ok(env_path) = env::var(CONFIG_FILE_ENV_VAR) {
+            PathBuf::from(env_path)
+        } else {
+            args.config_file.clone()
+        };
+        
+        return Config::default().save(&config_path);
     }
     
     // Load and validate configuration
@@ -522,14 +606,14 @@ async fn main() -> Result<(), AppError> {
     println!("Configuration:\n{}", config);
     
     // Validate mode
-    let mode = args.mode.as_str();
+    let mode = config.mode.as_deref().unwrap_or("");
     if !["sender", "receiver", "both"].contains(&mode) {
         return Err(AppError::InvalidMode(mode.to_string()));
     }
     
-    // For receiver and both modes, verify token upfront
-    if (mode == "receiver" || mode == "both") && config.token.is_none() {
-        return Err(AppError::MissingToken);
+    // For receiver and both modes, verify authentication upfront
+    if (mode == "receiver" || mode == "both") && !config.has_authentication() {
+        return Err(AppError::MissingAuthentication);
     }
     
     match mode {
@@ -554,13 +638,13 @@ async fn main() -> Result<(), AppError> {
 
             println!("in receiver mode");
 
-            if config.token.is_none() {
-                eprintln!("InfluxDB token not provided. Exiting...");
+            if !config.has_authentication() {
+                eprintln!("InfluxDB authentication not provided. Exiting...");
                 return Ok(());
             }
+            
             let (tx, rx) = mpsc::channel(100);
-            let influx_client = Client::new(config.influx_url.clone(), config.database.clone())
-                .with_token(config.token.expect("token not found").clone());
+            let influx_client = create_influx_client(&config)?;
 
             let mut reporter = InfluxReporter {
                 client: influx_client,
@@ -592,13 +676,13 @@ async fn main() -> Result<(), AppError> {
 
             println!("in both mode");
 
-            if config.token.is_none() {
-                eprintln!("InfluxDB token not provided. Exiting...");
+            if !config.has_authentication() {
+                eprintln!("InfluxDB authentication not provided. Exiting...");
                 return Ok(());
             }
+            
             let (tx, rx) = mpsc::channel(100);
-            let influx_client = Client::new(config.influx_url.clone(), config.database.clone())
-                .with_token(config.token.expect("token not found").clone());
+            let influx_client = create_influx_client(&config)?;
 
             let mut reporter = InfluxReporter {
                 client: influx_client,

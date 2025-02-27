@@ -1,16 +1,19 @@
-FROM rust AS builder
+FROM rust:alpine AS builder
+
+# Install required build dependencies
+RUN apk --no-cache add musl-dev
 
 WORKDIR /usr/src/packet-flow
 COPY . .
 
 # Build with release optimizations
-RUN cargo install --path .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/packet-flow/target \
+    cargo install --path .
 
 # Runtime stage
 FROM alpine:latest
-
-# Install required runtime dependencies
-# RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 
@@ -21,4 +24,4 @@ COPY --from=builder /usr/local/cargo/bin/packet-flow .
 RUN addgroup -S appuser && adduser -S appuser -G appuser && chown -R appuser:appuser /app
 USER appuser
 
-ENTRYPOINT ["/app/packet-flow"]
+ CMD ["/app/packet-flow"]
