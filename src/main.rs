@@ -402,7 +402,21 @@ impl UdpSender {
                 };
 
                 if let Ok(data) = bincode::serialize(&packet) {
-                    self.socket.send(&data).await.unwrap();
+                    match self.socket.send(&data).await {
+                        Ok(_) => {},
+                        Err(e) => {
+                            match e.kind() {
+                                std::io::ErrorKind::ConnectionRefused => {
+                                    eprintln!("Connection refused, ignoring...");
+                                    continue;
+                                }
+                                _ => {
+                                    eprintln!("Socket error: {}", e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 sequence += 1;
