@@ -1,6 +1,7 @@
 use chrono::prelude::{DateTime, Utc};
 use clap::Parser;
 use influxdb::{Client, InfluxDbWriteable, WriteQuery};
+use log::{debug, error, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -132,7 +133,7 @@ impl Config {
             if let Ok(rate) = val.parse::<u64>() {
                 self.rate = rate;
             } else {
-                eprintln!("Warning: Invalid PACKET_FLOW_RATE value '{}', ignoring", val);
+                warn!("Invalid PACKET_FLOW_RATE value '{}', ignoring", val);
             }
         }
         
@@ -193,7 +194,7 @@ impl Config {
         // Check that mode is valid
         if let Some(ref mode) = self.mode {
             if !["sender", "receiver", "both"].contains(&mode.as_str()) {
-                return Err(AppError::InvalidMode(mode.clone()));
+                return Err(AppError::InvalidMode(format!("{}, choose from 'sender', 'receiver', or 'both'.",mode.clone())));
             }
         }
         // Check that addresses are valid
@@ -233,7 +234,7 @@ impl Config {
         
         // Check for config file path in environment variable
         let config_path = if let Ok(env_path) = env::var(CONFIG_FILE_ENV_VAR) {
-            println!("Using config file from environment variable: {}", env_path);
+            info!("Using config file from environment variable: {}", env_path);
             PathBuf::from(env_path)
         } else {
             args.config_file.clone()
@@ -241,17 +242,17 @@ impl Config {
         
         let mut config = if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
-            println!("Reading configuration from file: {}", config_path.display());
+            info!("Reading configuration from file: {}", config_path.display());
             match toml::from_str::<Config>(&contents) {
                 Ok(config) => config,
                 Err(e) => {
-                    eprintln!("Error parsing config file: {}", e);
-                    println!("Falling back to default configuration");
+                    error!("Error parsing config file: {}", e);
+                    info!("Falling back to default configuration");
                     Config::default()
                 }
             }
         } else {
-            println!("Config file not found. Using default configuration.");
+            info!("Config file not found. Using default configuration.");
             Config::default()
         };
         
@@ -271,7 +272,7 @@ impl Config {
     fn save(&self, path: &PathBuf) -> Result<(), AppError> {
         let contents = toml::to_string_pretty(self).map_err(AppError::TomlSerialize)?;
         std::fs::write(path, contents)?;
-        println!("Default configuration saved to {}", path.display());
+        info!("Default configuration saved to {}", path.display());
         Ok(())
     }
 }
@@ -313,7 +314,6 @@ struct Latency {
 struct Packet {
     sequence: u64,
     timestamp_us: u64,
-    source: String,
     is_final: bool, // New field to indicate this is the final packet from this sender
 }
 
@@ -330,13 +330,14 @@ struct InfluxReporter {
 
 impl InfluxReporter {
     async fn run(&mut self) {
-        println!(
+        info!(
             "Reporting measurements to InfluxDB at {}...",
             self.client.database_url()
         );
         let mut messurements: Vec<Measurement> = Vec::new();
         loop {
             self.rx.recv_many(&mut messurements, 100).await;
+            trace!("Flushing batch of {} measurements", messurements.len());
             self.flush_batch(&mut messurements).await;
         }
     }
@@ -353,7 +354,10 @@ impl InfluxReporter {
             }
         }
 
-        self.client.query(&queries).await.unwrap();
+        match self.client.query(&queries).await {
+            Ok(x) => trace!("Batch of {} measurements written to InfluxDB, got back: {}", queries.len(), x),
+            Err(e) => error!("Error writing measurements to InfluxDB: {}", e),
+        }
     }
 }
 
@@ -365,7 +369,7 @@ struct UdpSender {
 
 impl UdpSender {
     async fn run(&self) {
-        println!(
+        info!(
             "Sending packets from {} to {}...",
             self.socket.local_addr().unwrap(),
             self.socket.peer_addr().unwrap()
@@ -384,7 +388,7 @@ impl UdpSender {
         tokio::spawn(async move {
             if let Ok(_) = signal::ctrl_c().await {
                 let _ = shutdown_tx.send(()).await;
-                println!("Received CTRL+C, shutting down sender");
+                info!("Received CTRL+C, shutting down sender");
             }
         });
 
@@ -397,21 +401,22 @@ impl UdpSender {
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_micros() as u64,
-                    source: self.local_addr.clone(),
                     is_final: false,
                 };
 
                 if let Ok(data) = bincode::serialize(&packet) {
                     match self.socket.send(&data).await {
-                        Ok(_) => {},
+                        Ok(_) => {
+                            trace!("Sent packet: sequence={}", sequence);
+                        },
                         Err(e) => {
                             match e.kind() {
                                 std::io::ErrorKind::ConnectionRefused => {
-                                    eprintln!("Connection refused, ignoring...");
+                                    warn!("Connection refused, ignoring...");
                                     continue;
                                 }
                                 _ => {
-                                    eprintln!("Socket error: {}", e);
+                                    error!("Socket error: {}", e);
                                     break;
                                 }
                             }
@@ -423,7 +428,7 @@ impl UdpSender {
                 }
 
                 _ = sigusr1.recv() => {
-                    println!("SIGUSR1 received, skipping a sequence number");
+                    info!("SIGUSR1 received, skipping a sequence number");
                     sequence += 1;
                     }
 
@@ -435,14 +440,13 @@ impl UdpSender {
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
                             .as_micros() as u64,
-                        source: self.local_addr.clone(),
                         is_final: true,
                     };
 
                     if let Ok(data) = bincode::serialize(&final_packet) {
                         let _ = self.socket.send(&data).await;
                     }
-                    println!("Sent final packet, shutting down sender");
+                    info!("Sent final packet, shutting down sender");
                     break;
                 }
             }
@@ -464,7 +468,7 @@ impl UdpReceiver {
         let mut last_sequences: HashMap<String, u64> = HashMap::new();
         let mut last_seen: HashMap<String, SystemTime> = HashMap::new();
 
-        println!("Listening on {}...", self.local_addr);
+        info!("Listening on {}...", self.local_addr);
 
         loop {
             // Check for timeouts before receiving next packet
@@ -482,7 +486,7 @@ impl UdpReceiver {
 
             // Report timeouts for each timed-out sender
             for sender in &timeout_senders {
-                println!("Timeout for sender: {}", sender);
+                warn!("Timeout for sender: {}", sender);
                 let loss = PacketLoss {
                     time: Utc::now(),
                     source: sender.clone(),
@@ -495,10 +499,12 @@ impl UdpReceiver {
                     .unwrap();
             }
 
-            match tokio::time::timeout(TokioDuration::from_secs(1), self.socket.recv(&mut buffer))
+            match tokio::time::timeout(TokioDuration::from_secs(1), self.socket.recv_from(&mut buffer))
                 .await
             {
-                Ok(Ok(size)) => {
+                Ok(Ok((size, addr))) => {
+                    let source = addr.to_string();
+                    
                     if let Ok(packet) = bincode::deserialize::<Packet>(&buffer[..size]) {
                         // Process the packet inline here instead of in a separate function
                         let now_micro = SystemTime::now()
@@ -508,31 +514,31 @@ impl UdpReceiver {
                         let latency = now_micro - packet.timestamp_us;
 
                         // Track last seen time for this sender
-                        last_seen.insert(packet.source.clone(), SystemTime::now());
+                        last_seen.insert(source.clone(), SystemTime::now());
 
                         // Handle "is_final" packet by removing the sender from tracking
                         if packet.is_final {
-                            println!(
+                            info!(
                                 "Received final packet from {}, removing from tracking",
-                                packet.source
+                                source
                             );
-                            last_sequences.remove(&packet.source);
-                            last_seen.remove(&packet.source);
+                            last_sequences.remove(&source);
+                            last_seen.remove(&source);
                             continue;
                         }
 
                         // Get or insert the last sequence number for this sender
                         let last_sequence = last_sequences
-                            .entry(packet.source.clone())
+                            .entry(source.clone())
                             .or_insert(packet.sequence);
 
                         // Check for packet loss if we've seen this sender before
                         if *last_sequence != packet.sequence
                             && packet.sequence > last_sequence.wrapping_add(1)
                         {
-                            println!(
+                            warn!(
                                 "Packet loss detected from {}: expected {}, got {}",
-                                packet.source,
+                                source,
                                 last_sequence.wrapping_add(1),
                                 packet.sequence
                             );
@@ -540,7 +546,7 @@ impl UdpReceiver {
                                 packet.sequence.wrapping_sub(last_sequence.wrapping_add(1));
                             let loss = PacketLoss {
                                 time: Utc::now(),
-                                source: packet.source.clone(),
+                                source: source.clone(),
                                 destination: self.local_addr.clone(),
                                 value: lost_packets,
                             };
@@ -553,10 +559,16 @@ impl UdpReceiver {
                         // Report latency
                         let latency_measurement = Latency {
                             time: Utc::now(),
-                            source: packet.source.clone(),
+                            source: source.clone(),
                             destination: self.local_addr.clone(),
                             value: latency,
                         };
+
+                        debug!(
+                            "Received packet from {}: sequence={}, latency={}us",
+                            source, packet.sequence, latency
+                        );
+
                         self.measurement_tx
                             .send(Measurement::Latency(latency_measurement))
                             .await
@@ -567,7 +579,7 @@ impl UdpReceiver {
                     }
                 }
                 Ok(Err(e)) => {
-                    eprintln!("Socket error: {}", e);
+                    error!("Socket error: {}", e);
                     break;
                 }
                 Err(_) => {
@@ -599,6 +611,9 @@ fn create_influx_client(config: &Config) -> Result<Client, AppError> {
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {
+    // Initialize the logger
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    
     let args = Args::parse();
     
     // Handle config generation request
@@ -617,7 +632,7 @@ async fn main() -> Result<(), AppError> {
     let config = Config::load(&args)?;
     
     // Show current configuration
-    println!("Configuration:\n{}", config);
+    info!("Configuration:\n{}", config);
     
     // Validate mode
     let mode = config.mode.as_deref().unwrap_or("");
@@ -635,7 +650,7 @@ async fn main() -> Result<(), AppError> {
             let socket = UdpSocket::bind("0.0.0.0:0").await?;
             socket.connect(&config.remote_addr).await?;
             
-            println!("Running in sender mode");
+            info!("Running in sender mode");
             
             let sender = UdpSender {
                 socket,
@@ -650,10 +665,10 @@ async fn main() -> Result<(), AppError> {
             let socket = UdpSocket::bind(&config.local_addr).await?;
             // socket.connect(&config.remote_addr).await?;
 
-            println!("in receiver mode");
+            info!("Running in receiver mode");
 
             if !config.has_authentication() {
-                eprintln!("InfluxDB authentication not provided. Exiting...");
+                error!("InfluxDB authentication not provided. Exiting...");
                 return Ok(());
             }
             
@@ -677,7 +692,7 @@ async fn main() -> Result<(), AppError> {
             let reporter_handle = tokio::spawn(async move { reporter.run().await });
 
             tokio::select! {
-                _ = signal::ctrl_c() => {println!("Shutting Down...")}
+                _ = signal::ctrl_c() => {info!("Shutting Down...")}
                 _ = receiver_handle => {}
                 _ = reporter_handle => {}
             }
@@ -688,10 +703,10 @@ async fn main() -> Result<(), AppError> {
 
             let receiver_socket = UdpSocket::bind(&config.local_addr).await?;
 
-            println!("in both mode");
+            info!("Running in both mode");
 
             if !config.has_authentication() {
-                eprintln!("InfluxDB authentication not provided. Exiting...");
+                error!("InfluxDB authentication not provided. Exiting...");
                 return Ok(());
             }
             
@@ -729,7 +744,7 @@ async fn main() -> Result<(), AppError> {
             }
         }
         _ => {
-            eprintln!("Invalid mode specified. Use 'sender', 'receiver', or 'both'.");
+            error!("Invalid mode specified. Use 'sender', 'receiver', or 'both'.");
             return Ok(());
         }
     }
