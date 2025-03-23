@@ -364,7 +364,6 @@ impl InfluxReporter {
 struct UdpSender {
     socket: UdpSocket,
     rate: TokioDuration,
-    local_addr: String,
 }
 
 impl UdpSender {
@@ -600,6 +599,8 @@ fn create_influx_client(config: &Config) -> Result<Client, AppError> {
         return Ok(client.with_token(token));
     }
     
+    log::debug!("No token provided, falling back to username/password auth");
+
     // Fall back to username/password auth
     if let (Some(username), Some(password)) = (&config.username, &config.password) {
         return Ok(client.with_auth(username, password));
@@ -655,7 +656,6 @@ async fn main() -> Result<(), AppError> {
             let sender = UdpSender {
                 socket,
                 rate: TokioDuration::from_millis(config.rate),
-                local_addr: config.local_addr.clone(),
             };
             
             let sender_handle = tokio::spawn(async move { sender.run().await });
@@ -721,7 +721,6 @@ async fn main() -> Result<(), AppError> {
             let sender = UdpSender {
                 socket: sender_socket,
                 rate: TokioDuration::from_millis(config.rate),
-                local_addr: config.local_addr.clone(),
             };
 
             let receiver = UdpReceiver {

@@ -24,4 +24,4 @@ COPY --from=builder /usr/local/cargo/bin/packet-flow .
 RUN addgroup -S appuser && adduser -S appuser -G appuser && chown -R appuser:appuser /app
 USER appuser
 
- CMD ["/app/packet-flow"]
+CMD ["/app/packet-flow"]

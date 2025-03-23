@@ -1,56 +1,17 @@
 ---
 services:
-  influxdb:
-    image: influxdb:2
-    container_name: influxdb
-    ports:
-      - "8086:8086"
+  sender-receiver:
+    image: registry.gecko.network/u6bkep/packet-flow:latest
+    container_name: packet_flow
     environment:
-      - INFLUXDB_HTTP_AUTH_ENABLED=true
-      - DOCKER_INFLUXDB_INIT_MODE=setup
-      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=9VjOMUBqJ8-81gvyzjSv4WVv39g2yF-ZJMKguK8NtDWMSbNsldp7ttFjTx4DMigL1JYntJor11RNvdoCUwDm0w== # token for testing purposes only. generate a new one for production.
-      - DOCKER_INFLUXDB_INIT_USERNAME=admin
-      - DOCKER_INFLUXDB_INIT_PASSWORD=adminadmin
-      - DOCKER_INFLUXDB_INIT_ORG=home
-      - DOCKER_INFLUXDB_INIT_BUCKET=packet_flow
-    volumes:
-      - influxdb-data:/var/lib/influxdb
-    healthcheck:
-      test: ["CMD", "influx", "ping", "-host", "http://localhost:8086"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  receiver:
-    # image: ghcr.io/u6bkep/packet-flow:latest # uncomment to use the image from the GitHub Container Registry
-    # build: 
-    #   context: .
-    #   tags:
-    #     - packet-flow
-    image: packet-flow
-    container_name: packet_flow_receiver
-    environment:
-      - PACKET_FLOW_MODE=receiver
-      - PACKET_FLOW_LOCAL_ADDR=0.0.0.0:8000
-      - PACKET_FLOW_INFLUX_URL=http://influxdb:8086
-      - PACKET_FLOW_DATABASE=packet_flow
-      - PACKET_FLOW_TOKEN=9VjOMUBqJ8-81gvyzjSv4WVv39g2yF-ZJMKguK8NtDWMSbNsldp7ttFjTx4DMigL1JYntJor11RNvdoCUwDm0w==
-    depends_on:
-      influxdb:
-        condition: service_healthy
-
-  sender:
-    image: packet-flow
-    container_name: packet_flow_sender
-    environment:
+      - RUST_LOG=info
       - PACKET_FLOW_MODE=sender
-      - PACKET_FLOW_REMOTE_ADDR=receiver:8000
-      - PACKET_FLOW_RATE=1000
-    depends_on:
-      influxdb:
-        condition: service_healthy
-      receiver:
-        condition: service_started
-
-volumes:
-  influxdb-data:
+      - PACKET_FLOW_REMOTE_ADDR=b-gateway.intern.gecko.network:8651
+      - PACKET_FLOW_RATE=100
+      - PACKET_FLOW_LOCAL_ADDR=0.0.0.0:8651
+      - PACKET_FLOW_INFLUX_URL=http://influxdb.b.intern.gecko.network:8086
+      - PACKET_FLOW_DATABASE=packet_flow
+      - PACKET_FLOW_TOKEN=rqEqiV9z3iBWLsy0pGIN-NZZdJc-lwuSc_aMpbU_ch5wXmEzC99mwE-n1bSJW3I5H3xtDfDLqjcOd52kWMDdKg==
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8651:8651"
