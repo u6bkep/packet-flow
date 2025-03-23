@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     net::UdpSocket,
     signal,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{broadcast, mpsc::{self, Receiver, Sender}},
     time::Duration as TokioDuration,
 };
 use thiserror::Error;
@@ -326,6 +326,7 @@ enum Measurement {
 struct InfluxReporter {
     client: Client,
     rx: Receiver<Measurement>,
+    shutdown_rx: broadcast::Receiver<()>,
 }
 
 impl InfluxReporter {
@@ -335,10 +336,29 @@ impl InfluxReporter {
             self.client.database_url()
         );
         let mut messurements: Vec<Measurement> = Vec::new();
+        let mut shutdown_rx = self.shutdown_rx.resubscribe();
+
         loop {
-            self.rx.recv_many(&mut messurements, 100).await;
-            trace!("Flushing batch of {} measurements", messurements.len());
-            self.flush_batch(&mut messurements).await;
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    info!("Shutdown signal received, flushing remaining measurements");
+                    // Try to receive any remaining measurements
+                    let _ = self.rx.recv_many(&mut messurements, 1000).await;
+                    if !messurements.is_empty() {
+                        self.flush_batch(&mut messurements).await;
+                    }
+                    info!("Reporter shutdown complete");
+                    break;
+                }
+                num = self.rx.recv_many(&mut messurements, 100) => {
+                    if num > 0 {
+                        trace!("Flushing batch of {} measurements", messurements.len());
+                        self.flush_batch(&mut messurements).await;
+                    } else {
+                        tokio::time::sleep(TokioDuration::from_millis(100)).await;
+                    }
+                }
+            }
         }
     }
 
@@ -364,6 +384,7 @@ impl InfluxReporter {
 struct UdpSender {
     socket: UdpSocket,
     rate: TokioDuration,
+    shutdown_rx: broadcast::Receiver<()>,
 }
 
 impl UdpSender {
@@ -375,61 +396,52 @@ impl UdpSender {
         );
         let mut sequence = 0u64;
         let mut interval = tokio::time::interval(self.rate);
+        let mut shutdown_rx = self.shutdown_rx.resubscribe();
 
         // Set up signal handler for SIGUSR1
         let mut sigusr1 =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
                 .expect("Failed to install SIGUSR1 handler");
 
-        // Set up a channel to receive shutdown notification
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-        // Handle CTRL+C signal to ensure we send final packet
-        tokio::spawn(async move {
-            if let Ok(_) = signal::ctrl_c().await {
-                let _ = shutdown_tx.send(()).await;
-                info!("Received CTRL+C, shutting down sender");
-            }
-        });
-
         loop {
             tokio::select! {
-            _ = interval.tick() => {
-                let packet = Packet {
-                    sequence,
-                    timestamp_us: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_micros() as u64,
-                    is_final: false,
-                };
+                _ = interval.tick() => {
+                    let packet = Packet {
+                        sequence,
+                        timestamp_us: SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_micros() as u64,
+                        is_final: false,
+                    };
 
-                if let Ok(data) = bincode::serialize(&packet) {
-                    match self.socket.send(&data).await {
-                        Ok(_) => {
-                            trace!("Sent packet: sequence={}", sequence);
-                        },
-                        Err(e) => {
-                            match e.kind() {
-                                std::io::ErrorKind::ConnectionRefused => {
-                                    warn!("Connection refused, ignoring...");
-                                    continue;
-                                }
-                                _ => {
-                                    error!("Socket error: {}", e);
-                                    break;
+                    if let Ok(data) = bincode::serialize(&packet) {
+                        match self.socket.send(&data).await {
+                            Ok(_) => {
+                                trace!("Sent packet: sequence={}", sequence);
+                            },
+                            Err(e) => {
+                                match e.kind() {
+                                    std::io::ErrorKind::ConnectionRefused => {
+                                        warn!("Connection refused, ignoring...");
+                                        continue;
+                                    }
+                                    _ => {
+                                        error!("Socket error: {}", e);
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                sequence += 1;
+                    sequence += 1;
                 }
 
                 _ = sigusr1.recv() => {
                     info!("SIGUSR1 received, skipping a sequence number");
                     sequence += 1;
-                    }
+                }
 
                 _ = shutdown_rx.recv() => {
                     // Send final packet with is_final=true
@@ -443,6 +455,7 @@ impl UdpSender {
                     };
 
                     if let Ok(data) = bincode::serialize(&final_packet) {
+                        info!("Shutdown signal received, sending final packet");
                         let _ = self.socket.send(&data).await;
                     }
                     info!("Sent final packet, shutting down sender");
@@ -458,6 +471,7 @@ struct UdpReceiver {
     measurement_tx: Sender<Measurement>,
     local_addr: String,
     timeout_duration: TokioDuration,
+    shutdown_rx: broadcast::Receiver<()>,
 }
 
 impl UdpReceiver {
@@ -466,22 +480,48 @@ impl UdpReceiver {
         // Track sequence numbers and last seen time for each sender
         let mut last_sequences: HashMap<String, u64> = HashMap::new();
         let mut last_seen: HashMap<String, SystemTime> = HashMap::new();
+        let mut shutdown_rx = self.shutdown_rx.resubscribe();
+        
+        // Define the sender deadness threshold (1 minute)
+        let sender_deadness_threshold = TokioDuration::from_secs(60);
 
         info!("Listening on {}...", self.local_addr);
 
         loop {
+            // Check for shutdown first
+            if let Ok(_) = shutdown_rx.try_recv() {
+                info!("Shutdown signal received, stopping receiver");
+                break;
+            }
+
             // Check for timeouts before receiving next packet
             let now = SystemTime::now();
+            let mut dead_senders = Vec::new();
             let timeout_senders: Vec<String> = last_seen
                 .iter()
                 .filter_map(|(sender, last_time)| {
-                    if now.duration_since(*last_time).ok()? > self.timeout_duration {
-                        Some(sender.clone())
+                    if let Ok(duration_since) = now.duration_since(*last_time) {
+                        // Check if sender should be considered dead (> 1 minute inactive)
+                        if duration_since > sender_deadness_threshold {
+                            dead_senders.push(sender.clone());
+                            None // Don't report timeout for dead senders, we'll remove them
+                        } else if duration_since > self.timeout_duration {
+                            Some(sender.clone())
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
                 })
                 .collect();
+
+            // Remove dead senders from tracking
+            for sender in &dead_senders {
+                info!("Sender {} has been inactive for over 1 minute, removing from tracking", sender);
+                last_sequences.remove(sender);
+                last_seen.remove(sender);
+            }
 
             // Report timeouts for each timed-out sender
             for sender in &timeout_senders {
@@ -587,6 +627,8 @@ impl UdpReceiver {
                 }
             }
         }
+        
+        info!("Receiver shutdown complete");
     }
 }
 
@@ -608,6 +650,39 @@ fn create_influx_client(config: &Config) -> Result<Client, AppError> {
     
     // No auth provided
     Err(AppError::MissingAuthentication)
+}
+
+// Setup signal handlers for graceful shutdown
+async fn setup_shutdown_signal() -> broadcast::Sender<()> {
+    let (shutdown_tx, _) = broadcast::channel(1);
+    let shutdown_tx_clone = shutdown_tx.clone();
+    
+    tokio::spawn(async move {
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler");
+        let mut sigquit = signal::unix::signal(signal::unix::SignalKind::quit())
+            .expect("Failed to install SIGQUIT handler");
+            
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                info!("SIGINT/CTRL+C received, initiating graceful shutdown");
+            }
+            _ = sigterm.recv() => {
+                info!("SIGTERM received, initiating graceful shutdown");
+            }
+            _ = sigquit.recv() => {
+                info!("SIGQUIT received, initiating graceful shutdown");
+            }
+        }
+        
+        // Notify all components to shut down
+        let _ = shutdown_tx_clone.send(());
+        
+        // Allow some time for cleanup before the process exits
+        tokio::time::sleep(TokioDuration::from_secs(2)).await;
+    });
+    
+    shutdown_tx
 }
 
 #[tokio::main]
@@ -641,6 +716,9 @@ async fn main() -> Result<(), AppError> {
         return Err(AppError::InvalidMode(mode.to_string()));
     }
     
+    // Setup shutdown signal handling
+    let shutdown_tx = setup_shutdown_signal().await;
+    
     // For receiver and both modes, verify authentication upfront
     if (mode == "receiver" || mode == "both") && !config.has_authentication() {
         return Err(AppError::MissingAuthentication);
@@ -656,14 +734,13 @@ async fn main() -> Result<(), AppError> {
             let sender = UdpSender {
                 socket,
                 rate: TokioDuration::from_millis(config.rate),
+                shutdown_rx: shutdown_tx.subscribe(),
             };
             
-            let sender_handle = tokio::spawn(async move { sender.run().await });
-            sender_handle.await.map_err(|_| AppError::InvalidConfig("Sender task failed".to_string()))?;
+            sender.run().await;
         }
         "receiver" => {
             let socket = UdpSocket::bind(&config.local_addr).await?;
-            // socket.connect(&config.remote_addr).await?;
 
             info!("Running in receiver mode");
 
@@ -678,24 +755,24 @@ async fn main() -> Result<(), AppError> {
             let mut reporter = InfluxReporter {
                 client: influx_client,
                 rx,
+                shutdown_rx: shutdown_tx.subscribe(),
             };
 
             let receiver = UdpReceiver {
                 socket,
-                measurement_tx: tx,
+                measurement_tx: tx.clone(),
                 local_addr: config.local_addr.clone(),
                 timeout_duration: TokioDuration::from_secs(5),
+                shutdown_rx: shutdown_tx.subscribe(),
             };
 
-            let receiver_handle = tokio::spawn(async move { receiver.run().await });
-
-            let reporter_handle = tokio::spawn(async move { reporter.run().await });
-
-            tokio::select! {
-                _ = signal::ctrl_c() => {info!("Shutting Down...")}
-                _ = receiver_handle => {}
-                _ = reporter_handle => {}
-            }
+            // Run both components concurrently
+            let (receiver_result, reporter_result) = tokio::join!(
+                receiver.run(),
+                reporter.run()
+            );
+            
+            info!("Receiver mode shutdown complete");
         }
         "both" => {
             let sender_socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -716,11 +793,13 @@ async fn main() -> Result<(), AppError> {
             let mut reporter = InfluxReporter {
                 client: influx_client,
                 rx,
+                shutdown_rx: shutdown_tx.subscribe(),
             };
 
             let sender = UdpSender {
                 socket: sender_socket,
                 rate: TokioDuration::from_millis(config.rate),
+                shutdown_rx: shutdown_tx.subscribe(),
             };
 
             let receiver = UdpReceiver {
@@ -728,24 +807,24 @@ async fn main() -> Result<(), AppError> {
                 measurement_tx: tx,
                 local_addr: config.local_addr.clone(),
                 timeout_duration: TokioDuration::from_secs(5),
+                shutdown_rx: shutdown_tx.subscribe(),
             };
 
-            let sender_handle = tokio::spawn(async move { sender.run().await });
-
-            let receiver_handle = tokio::spawn(async move { receiver.run().await });
-
-            let reporter_handle = tokio::spawn(async move { reporter.run().await });
-
-            tokio::select! {
-                _ = sender_handle => {}
-                _ = receiver_handle => {}
-                _ = reporter_handle => {}
-            }
+            // Run all components concurrently
+            let (sender_result, receiver_result, reporter_result) = tokio::join!(
+                sender.run(),
+                receiver.run(),
+                reporter.run()
+            );
+            
+            info!("Both mode shutdown complete");
         }
         _ => {
             error!("Invalid mode specified. Use 'sender', 'receiver', or 'both'.");
             return Ok(());
         }
     }
+    
+    info!("Application shutdown complete");
     Ok(())
 }
