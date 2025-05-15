@@ -297,7 +297,9 @@ impl std::fmt::Display for Config {
 #[derive(InfluxDbWriteable, Clone)]
 struct PacketLoss {
     time: DateTime<Utc>,
+    #[influxdb(tag)]
     source: String,
+    #[influxdb(tag)]
     destination: String,
     value: u64,
 }
@@ -305,7 +307,9 @@ struct PacketLoss {
 #[derive(InfluxDbWriteable, Clone)]
 struct Latency {
     time: DateTime<Utc>,
+    #[influxdb(tag)]
     source: String,
+    #[influxdb(tag)]
     destination: String,
     value: u64,
 }
